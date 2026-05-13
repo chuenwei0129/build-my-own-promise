@@ -1,0 +1,9 @@
+{
+	"devDependencies": {
+		"promises-aplus-tests": "^2.1.2"
+	},
+	"scripts": {
+		"test:aplus": "promises-aplus-tests promise.aplus.js",
+		"test:es": "promises-aplus-tests promise.es.js"
+	}
+}

@@ -1,0 +1,10 @@
+# 依赖目录
+node_modules/
+
+# 编辑器
+.vscode/
+
+# 操作系统
+.DS_Store
+# 这是 Windows 系统 的缩略图缓存文件
+Thumbs.db
