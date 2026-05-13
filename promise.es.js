@@ -82,15 +82,41 @@ class EsPromise {
         return rejectPromise(new TypeError('Chaining cycle detected'));
       }
 
-      // 本文主线只展开到 resolve(promise)
-      if (value instanceof EsPromise) {
-        queueMicrotask(() => {
-          value.then(resolvePromise, rejectPromise);
-        });
-        return;
+      if ((typeof value === 'object' && value !== null) || typeof value === 'function') {
+        let then;
+        try {
+          then = value.then;
+        } catch (e) {
+          return rejectPromise(e);
+        }
+
+        if (typeof then === 'function') {
+          queueMicrotask(() => {
+            let isCalled = false;
+            try {
+              then.call(
+                value,
+                resolvedValue => {
+                  if (isCalled) return;
+                  isCalled = true;
+                  resolvePromise(resolvedValue);
+                },
+                reason => {
+                  if (isCalled) return;
+                  isCalled = true;
+                  rejectPromise(reason);
+                }
+              );
+            } catch (e) {
+              if (isCalled) return;
+              isCalled = true;
+              rejectPromise(e);
+            }
+          });
+          return;
+        }
       }
 
-      // 普通值直接 fulfilled
       fulfillPromise(value);
     };
 

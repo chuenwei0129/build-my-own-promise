@@ -62,7 +62,7 @@ promise4
    - 构造函数里的 `resolve(promise)`
    - `then` 回调返回 Promise 时的状态吸收
 
-严格来说，原生 Promise 对 `resolve(thenable)` 也有一套规则；但它和本文这两道题想说明的核心矛盾无关，下面只做提及，不展开实现。
+严格来说，原生 Promise 对 `resolve(thenable)` 也有一套规则；但它和本文这两道题想说明的核心矛盾不在同一个层面。所以下面先不展开，放到最后作为“补齐规范语义”的最后一步再说。
 
 ---
 
@@ -195,7 +195,9 @@ const resolve = (value) => {
 };
 ```
 
-这时还会顺手冒出一个新问题：为什么实现里还要多一把 `isResolved` 锁？
+不过，把 `value.then(...)` 挪到微任务里之后，`resolve(promise)` 就不再是“调用完立刻落状态”了。
+
+这会带出一个连带问题：为什么实现里还要多一把 `isResolved` 锁？
 
 原因是，A+ 版本的 `resolve(value)` 一调用就会立刻把状态改成 fulfilled，所以只靠 `state !== 'pending'` 就已经能挡住后续的重复决议。
 
@@ -218,6 +220,44 @@ new EsPromise((resolve, reject) => {
 所以 `isResolved` 锁住的不是“状态已经 fulfilled / rejected 了”，而是：
 
 > 第一次决议机会已经用掉了，哪怕最终状态还没真正落地。
+
+代码上，最直接的补法就是把“接管状态”和“用掉第一次决议机会”拆开：
+
+```js
+let isResolved = false;
+
+const resolvePromise = (value) => {
+  if (value === this) {
+    return rejectPromise(new TypeError('Chaining cycle detected'));
+  }
+
+  if (value instanceof AplusPromise) {
+    queueMicrotask(() => {
+      value.then(resolvePromise, rejectPromise);
+    });
+    return;
+  }
+
+  fulfillPromise(value);
+};
+
+const resolve = (value) => {
+  if (isResolved) return;
+  isResolved = true;
+  resolvePromise(value);
+};
+
+const reject = (reason) => {
+  if (isResolved) return;
+  isResolved = true;
+  rejectPromise(reason);
+};
+```
+
+这里要注意两点：
+
+- `resolvePromise` 负责“怎么接管 / 怎么落状态”
+- `isResolved` 负责“第一次决议机会是不是已经被用掉了”
 
 补上这一层之后，第一道题的微任务调度行为终于会对齐原生 Promise：
 
@@ -389,11 +429,96 @@ queueMicrotask(() => {
 
 ---
 
-## 顺带一提：`resolve(thenable)` 还有额外规则
+## 最后再补一步：`resolve(thenable)`
 
-如果继续往规范靠近，构造函数里的 `resolve(x)` 其实不只要处理 Promise，还要处理 thenable。
+到这里，两道题的输出顺序已经对齐原生 Promise 了。
 
-不过这件事和本文两道题的关键点不是同一个层面：前面讨论的是“多补一轮微任务，输出顺序为什么会变”，而 `resolve(thenable)` 更偏向“吸收范围和边角语义要不要继续补齐”。所以这里先只提一下，不把它展开到正文实现里。
+不过如果目标不是“跑通这两道题”，而是“让构造函数里的 `resolve(x)` 更像原生 Promise”，还差最后一步：**不能只认 Promise 实例，还要认 thenable。**
+
+也就是说，下面这种值：
+
+```js
+const x = {
+  then(resolve) {
+    resolve(1);
+  }
+};
+```
+
+在原生 Promise 里：
+
+```js
+Promise.resolve(x).then(v => console.log(v)); // 1
+```
+
+它不会把 `x` 当普通对象直接 fulfilled，而是会把它当作 thenable 继续吸收。
+
+所以构造函数里的 `resolvePromise` 不能只写：
+
+```js
+if (value instanceof EsPromise) {
+  queueMicrotask(() => {
+    value.then(resolvePromise, rejectPromise);
+  });
+  return;
+}
+```
+
+还要升级成“只要是对象或函数，就尝试取 `then`”：
+
+```js
+if ((typeof value === 'object' && value !== null) || typeof value === 'function') {
+  let then;
+  try {
+    then = value.then;
+  } catch (e) {
+    return rejectPromise(e);
+  }
+
+  if (typeof then === 'function') {
+    queueMicrotask(() => {
+      let isCalled = false;
+      try {
+        then.call(
+          value,
+          resolvedValue => {
+            if (isCalled) return;
+            isCalled = true;
+            resolvePromise(resolvedValue);
+          },
+          reason => {
+            if (isCalled) return;
+            isCalled = true;
+            rejectPromise(reason);
+          }
+        );
+      } catch (e) {
+        if (isCalled) return;
+        isCalled = true;
+        rejectPromise(e);
+      }
+    });
+    return;
+  }
+}
+```
+
+这里会顺手补上一个容易漏掉的语义：**first-call-wins**。
+
+也就是说，thenable 一旦先调用了 `resolve` 或 `reject`，后面的同步抛错、第二次调用，都必须失效。比如：
+
+```js
+const x = {
+  then(resolve) {
+    resolve(1);
+    throw new Error('boom');
+  }
+};
+```
+
+原生 Promise 的结果是 fulfilled，值为 `1`，而不是 rejected。上面这段 `isCalled` 保护，补的就是这个边角行为。
+
+这一步不会再改变前面两道题的输出顺序，但会让 `resolve(x)` 的吸收范围和边角语义更接近原生 Promise。
 
 ---
 
@@ -418,7 +543,7 @@ queueMicrotask(() => {
 
 ## 最终实现
 
-下面这版代码保留了 A+ 里 `then` 返回值的解析逻辑；但构造函数里的 `resolve` 只展开到 `resolve(promise)`，不继续处理 `resolve(thenable)`。
+下面这版代码保留了 A+ 里 `then` 返回值的解析逻辑，同时也把构造函数里的 `resolve(thenable)` 一并补齐了。
 
 ```js
 const handleThenResult = (promise2, value, resolve, reject) => {
@@ -473,7 +598,7 @@ class EsPromise {
     this.reason = undefined;
     this.onFulfilledCallbacks = [];
     this.onRejectedCallbacks = [];
-    // 锁住 executor 的首次决议，防止 resolve(promise) 的异步接管空窗期被二次决议钻进去
+    // 锁住 executor 的首次决议，防止异步接管空窗期被二次决议钻进去
     let isResolved = false;
 
     // 辅助函数：直接敲定 fulfilled 状态
@@ -501,15 +626,41 @@ class EsPromise {
         return rejectPromise(new TypeError('Chaining cycle detected'));
       }
 
-      // 本文主线只展开到 resolve(promise)
-      if (value instanceof EsPromise) {
-        queueMicrotask(() => {
-          value.then(resolvePromise, rejectPromise);
-        });
-        return;
+      if ((typeof value === 'object' && value !== null) || typeof value === 'function') {
+        let then;
+        try {
+          then = value.then;
+        } catch (e) {
+          return rejectPromise(e);
+        }
+
+        if (typeof then === 'function') {
+          queueMicrotask(() => {
+            let isCalled = false;
+            try {
+              then.call(
+                value,
+                resolvedValue => {
+                  if (isCalled) return;
+                  isCalled = true;
+                  resolvePromise(resolvedValue);
+                },
+                reason => {
+                  if (isCalled) return;
+                  isCalled = true;
+                  rejectPromise(reason);
+                }
+              );
+            } catch (e) {
+              if (isCalled) return;
+              isCalled = true;
+              rejectPromise(e);
+            }
+          });
+          return;
+        }
       }
 
-      // 普通值直接 fulfilled
       fulfillPromise(value);
     };
 
@@ -593,13 +744,12 @@ module.exports = EsPromise;
 
 ## 总结
 
-从 Promises/A+ 走到在微任务调度行为上更接近原生 Promise，本文主线主要补齐三件事：
+从 Promises/A+ 走到在微任务调度行为上更接近原生 Promise，至少还要补齐四件事：
 
 1. **`resolve(promise)` 不能把 Promise 当普通值**，而要接管它的状态。
 2. **这次状态接管不能同步发生**，而要再晚一轮微任务。
-3. **`then` 回调返回 Promise 时**，它的吸收过程也要再晚一轮微任务。
-
-如果再往前走一步，当然还可以继续补 `resolve(thenable)` 这类规则，但那已经不是这篇文章想聚焦的问题了。
+3. **`then` 回调返回 Promise 或 thenable 时**，它的吸收过程也要再晚一轮微任务。
+4. **构造函数里的 `resolve(x)` 还要覆盖 thenable**，并保证 first-call-wins。
 
 所以这篇文章真正想讲的不是“Promise 很难写”，而是：
 
